@@ -1,0 +1,224 @@
+// Vercel Serverless Function: pulls Meta Ads data for every workspace with a Meta ad
+// account and writes it to Supabase. Triggered by Vercel Cron (see vercel.json).
+//
+// Per workspace it:
+//   1. Reads last-30-day ad-level insights (spend, impressions, outbound clicks, actions).
+//   2. Reads each ad's real delivery status and creation time.
+//   3. Matches ads to existing ad_creatives rows (by meta_ad_id, else claims a manually
+//      created row with the same asset code) so nothing is duplicated, then writes them.
+//      Synced ads with no delivery in the window are zeroed instead of keeping old figures.
+//   4. Computes spend since the first M-Pesa top-up for an accurate prepaid balance.
+import { createClient } from '@supabase/supabase-js';
+import { timingSafeEqual } from 'node:crypto';
+
+const GRAPH = 'https://graph.facebook.com/v21.0';
+const INSIGHT_FIELDS = 'ad_id,ad_name,spend,impressions,outbound_clicks,actions';
+// Click-to-WhatsApp inquiries first, then classic lead events.
+const LEAD_ACTION_TYPES = [
+  'onsite_conversion.messaging_conversation_started_7d',
+  'lead',
+  'onsite_conversion.lead_grouped',
+  'offsite_conversion.fb_pixel_lead'
+];
+const PAUSED_STATUSES = new Set([
+  'PAUSED',
+  'CAMPAIGN_PAUSED',
+  'ADSET_PAUSED',
+  'PENDING_REVIEW',
+  'IN_PROCESS',
+  'PENDING_BILLING_INFO',
+  'WITH_ISSUES'
+]);
+
+const sumAction = (list, type) =>
+  (Array.isArray(list) ? list : [])
+    .filter((a) => a.action_type === type)
+    .reduce((s, a) => s + (Number(a.value) || 0), 0);
+
+function leadsFrom(actions) {
+  for (const type of LEAD_ACTION_TYPES) {
+    const n = sumAction(actions, type);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
+// Meta effective_status -> app status. Ads missing from the ads listing were deleted/archived.
+function mapStatus(effectiveStatus) {
+  if (!effectiveStatus) return 'Killed';
+  if (effectiveStatus === 'ACTIVE') return 'Active';
+  if (PAUSED_STATUSES.has(effectiveStatus)) return 'Paused';
+  return 'Killed'; // DISAPPROVED, ARCHIVED, DELETED, ...
+}
+
+// "VID_GROUP-MARKUP_V1_A001" -> "A001" (underscore-delimited, so \b cannot be used).
+export const assetCodeFrom = (name) =>
+  (String(name || '').match(/(?:^|[^A-Za-z0-9])(A\d{3,})(?!\d)/) || [])[1] || null;
+
+async function graphGetAll(path, params, token) {
+  const qs = new URLSearchParams({ ...params, limit: '500', access_token: token });
+  let url = `${GRAPH}/${path}?${qs}`;
+  const rows = [];
+  while (url) {
+    const resp = await fetch(url);
+    const body = await resp.json();
+    if (!resp.ok || body.error) {
+      throw new Error(body.error?.message || `Meta API HTTP ${resp.status}`);
+    }
+    rows.push(...(body.data || []));
+    url = body.paging?.next || null;
+  }
+  return rows;
+}
+
+function authorized(req) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return false; // fail closed: the endpoint is never public
+  const expected = Buffer.from(`Bearer ${secret}`);
+  const given = Buffer.from(String(req.headers.authorization || ''));
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+
+export async function syncWorkspace(db, ws, token) {
+  const act = `act_${String(ws.meta_ad_account_id).replace(/^act_/, '')}`;
+  const now = new Date().toISOString();
+
+  const [insights, ads, existingRes, firstTopupRes] = await Promise.all([
+    graphGetAll(`${act}/insights`, { level: 'ad', date_preset: 'last_30d', fields: INSIGHT_FIELDS }, token),
+    graphGetAll(`${act}/ads`, { fields: 'id,name,effective_status,created_time' }, token),
+    db.from('ad_creatives').select('id, meta_ad_id, asset_code, name').eq('workspace_id', ws.id),
+    db
+      .from('mpesa_topups')
+      .select('created_at')
+      .eq('workspace_id', ws.id)
+      .order('created_at', { ascending: true })
+      .limit(1)
+  ]);
+  if (existingRes.error) throw existingRes.error;
+  if (firstTopupRes.error) throw firstTopupRes.error;
+
+  const adsById = new Map(ads.map((a) => [a.id, a]));
+  const insightsById = new Map(insights.map((r) => [r.ad_id, r]));
+  const existing = existingRes.data || [];
+  const byMetaId = new Map(existing.filter((r) => r.meta_ad_id).map((r) => [r.meta_ad_id, r]));
+  const unclaimed = existing.filter((r) => !r.meta_ad_id);
+
+  // Ads to write: anything that delivered in the window, anything currently live (may not
+  // have delivered yet), and every ad already synced (so stale figures get zeroed).
+  const targetIds = new Set([
+    ...insightsById.keys(),
+    ...ads.filter((a) => a.effective_status === 'ACTIVE').map((a) => a.id),
+    ...byMetaId.keys()
+  ]);
+
+  const updates = [];
+  const inserts = [];
+  for (const adId of targetIds) {
+    const ins = insightsById.get(adId);
+    const meta = adsById.get(adId);
+    const name = ins?.ad_name || meta?.name || null;
+    const fields = {
+      meta_ad_id: adId,
+      name,
+      status: mapStatus(meta?.effective_status),
+      spend: Number(ins?.spend) || 0,
+      impressions: Number(ins?.impressions) || 0,
+      three_sec_views: sumAction(ins?.actions, 'video_view'),
+      outbound_clicks: sumAction(ins?.outbound_clicks, 'outbound_click'),
+      leads: leadsFrom(ins?.actions),
+      updated_at: now,
+      ...(meta?.created_time ? { launched_at: new Date(meta.created_time).toISOString() } : {})
+    };
+
+    let row = byMetaId.get(adId);
+    if (!row) {
+      // Claim a manually created creative for the same asset instead of duplicating it.
+      const code = assetCodeFrom(name);
+      const idx = unclaimed.findIndex(
+        (r) => (code && r.asset_code === code) || (name && r.name === name)
+      );
+      if (idx >= 0) row = unclaimed.splice(idx, 1)[0];
+    }
+
+    if (row) updates.push({ id: row.id, fields });
+    else inserts.push({ ...fields, workspace_id: ws.id, asset_code: assetCodeFrom(name) });
+  }
+
+  // Per-row updates keep untouched columns (asset_code, bucket) intact.
+  const results = await Promise.all(
+    updates.map(({ id, fields }) => db.from('ad_creatives').update(fields).eq('id', id))
+  );
+  const failedUpdate = results.find((r) => r.error);
+  if (failedUpdate) throw failedUpdate.error;
+
+  if (inserts.length) {
+    const { error } = await db
+      .from('ad_creatives')
+      .upsert(inserts, { onConflict: 'workspace_id,meta_ad_id' });
+    if (error) throw error;
+  }
+
+  // Spend since the first top-up, for the prepaid M-Pesa balance.
+  const wsPatch = { last_synced_at: now, prepaid_spend: null, prepaid_spend_since: null };
+  const firstTopup = firstTopupRes.data?.[0];
+  if (firstTopup) {
+    const since = firstTopup.created_at.slice(0, 10);
+    const until = now.slice(0, 10);
+    const acct = await graphGetAll(
+      `${act}/insights`,
+      { level: 'account', fields: 'spend', time_range: JSON.stringify({ since, until }) },
+      token
+    );
+    wsPatch.prepaid_spend = acct.reduce((s, r) => s + (Number(r.spend) || 0), 0);
+    wsPatch.prepaid_spend_since = since;
+  }
+  const { error: wsErr } = await db.from('workspaces').update(wsPatch).eq('id', ws.id);
+  if (wsErr) throw wsErr;
+
+  return { updated: updates.length, inserted: inserts.length, prepaidSpend: wsPatch.prepaid_spend };
+}
+
+export default async function handler(req, res) {
+  if (!process.env.CRON_SECRET) {
+    return res.status(500).json({ error: 'CRON_SECRET is not configured; refusing to run.' });
+  }
+  if (!authorized(req)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const token = process.env.META_ACCESS_TOKEN;
+  if (!supabaseUrl || !serviceKey || !token) {
+    return res.status(500).json({
+      error: 'Missing SUPABASE_URL/VITE_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or META_ACCESS_TOKEN'
+    });
+  }
+
+  const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
+
+  const { data: workspaces, error } = await db
+    .from('workspaces')
+    .select('id, name, meta_ad_account_id')
+    .not('meta_ad_account_id', 'is', null)
+    .neq('meta_ad_account_id', '');
+  if (error) return res.status(500).json({ error: error.message });
+
+  const results = [];
+  for (const ws of workspaces) {
+    try {
+      results.push({ workspace: ws.name, ok: true, ...(await syncWorkspace(db, ws, token)) });
+    } catch (err) {
+      console.error(`sync-meta failed for ${ws.name}:`, err);
+      results.push({ workspace: ws.name, ok: false, error: err.message });
+    }
+  }
+
+  const failed = results.filter((r) => !r.ok).length;
+  return res.status(failed && failed === results.length ? 502 : 200).json({
+    syncedAt: new Date().toISOString(),
+    workspaces: results.length,
+    failed,
+    results
+  });
+}
