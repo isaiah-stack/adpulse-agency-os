@@ -1,5 +1,5 @@
 {
-  "crons": [{ "path": "/api/sync-meta", "schedule": "0 */6 * * *" }],
+  "crons": [{ "path": "/api/sync-meta", "schedule": "0 3 * * *" }],
   "functions": {
     "api/sync-meta.js": { "maxDuration": 60 }
   },
