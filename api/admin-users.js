@@ -6,27 +6,10 @@
 //   Authorization: Bearer <caller's Supabase access token>
 //   { "action": "invite", "email", "fullName", "role": "admin"|"client", "workspaceId" }
 //   { "action": "delete", "userId" }
-import { createClient } from '@supabase/supabase-js';
+import { serviceClient, requireAdmin } from './_lib/supabaseAdmin.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function serviceClient() {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return null;
-  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
-}
-
-// Resolve the caller from their access token and require an admin profile.
-async function requireAdmin(db, req) {
-  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!token) return null;
-  const { data, error } = await db.auth.getUser(token);
-  if (error || !data?.user) return null;
-  const { data: profile } = await db.from('profiles').select('id, role').eq('id', data.user.id).maybeSingle();
-  return profile?.role === 'admin' ? data.user : null;
-}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {

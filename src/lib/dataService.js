@@ -34,6 +34,12 @@ function workspaceFromRows(ws, creatives = [], leads = [], topups = []) {
     currency: ws.currency || 'KES',
     currentPhase: ws.phase || 'Phase 1: Track Money',
     lastSyncedAt: ws.last_synced_at,
+    // Sync health (admin-only columns; absent for clients, who read client_workspace()).
+    lastSyncAttemptAt: ws.last_sync_attempt_at ?? null,
+    lastSyncError: ws.last_sync_error ?? null,
+    metaTokenExpiresAt: ws.meta_token_expires_at ?? null,
+    adAccountCurrency: ws.ad_account_currency ?? null,
+    fxRate: ws.fx_rate ?? null,
     // Synced creative spend is Meta's last_30d window; analytics aligns leads to it.
     spendWindowDays: ws.last_synced_at ? 30 : 0,
     // Spend since the first M-Pesa top-up (null until the sync has computed it).

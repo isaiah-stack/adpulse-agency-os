@@ -46,6 +46,12 @@ alter table public.workspaces add column if not exists ad_account_currency text;
 alter table public.workspaces add column if not exists fx_rate_override numeric check (fx_rate_override > 0);
 alter table public.workspaces add column if not exists fx_rate numeric;
 alter table public.workspaces add column if not exists fx_rate_at timestamptz;
+-- Sync health, written by /api/sync-meta and shown to admins (never to clients).
+--   last_sync_attempt_at / last_sync_error: outcome of the latest run (error null on success).
+--   meta_token_expires_at: when the Meta token (or its data access) expires; null = never/unknown.
+alter table public.workspaces add column if not exists last_sync_attempt_at timestamptz;
+alter table public.workspaces add column if not exists last_sync_error text;
+alter table public.workspaces add column if not exists meta_token_expires_at timestamptz;
 
 create table if not exists public.profiles (
   id           uuid primary key references auth.users (id) on delete cascade,
