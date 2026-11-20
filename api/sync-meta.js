@@ -8,6 +8,8 @@
 //      created row with the same asset code) so nothing is duplicated, then writes them.
 //      Synced ads with no delivery in the window are zeroed instead of keeping old figures.
 //   4. Computes spend since the first M-Pesa top-up for an accurate prepaid balance.
+//   5. Converts spend from the ad account's currency (e.g. USD) into the workspace currency
+//      (e.g. KES) using workspaces.fx_rate_override, else a daily market rate.
 import { createClient } from '@supabase/supabase-js';
 import { timingSafeEqual } from 'node:crypto';
 
@@ -71,6 +73,31 @@ async function graphGetAll(path, params, token) {
   return rows;
 }
 
+const FX_API = 'https://open.er-api.com/v6/latest';
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/**
+ * Rate to turn ad-account money into workspace money (1 `from` = rate `to`).
+ * Order: same currency -> 1; admin override; live market rate; last stored rate.
+ * Throws rather than silently saving unconverted figures.
+ */
+export async function resolveFxRate(ws, from, to, fetchImpl = fetch) {
+  if (!from || !to || from === to) return { rate: 1, source: 'same-currency' };
+  const override = Number(ws.fx_rate_override);
+  if (override > 0) return { rate: override, source: 'override' };
+  try {
+    const resp = await fetchImpl(`${FX_API}/${encodeURIComponent(from)}`);
+    const body = await resp.json();
+    const rate = Number(body?.rates?.[to]);
+    if (resp.ok && body?.result === 'success' && rate > 0) return { rate, source: 'market' };
+    throw new Error(`no ${from}->${to} rate in FX response`);
+  } catch (err) {
+    const last = Number(ws.fx_rate);
+    if (last > 0 && ws.ad_account_currency === from) return { rate: last, source: 'last-known' };
+    throw new Error(`Cannot convert ${from} to ${to}: ${err.message}. Set workspaces.fx_rate_override.`);
+  }
+}
+
 function authorized(req) {
   const secret = process.env.CRON_SECRET;
   if (!secret) return false; // fail closed: the endpoint is never public
@@ -82,6 +109,16 @@ function authorized(req) {
 export async function syncWorkspace(db, ws, token) {
   const act = `act_${String(ws.meta_ad_account_id).replace(/^act_/, '')}`;
   const now = new Date().toISOString();
+
+  const acctResp = await fetch(`${GRAPH}/${act}?${new URLSearchParams({ fields: 'currency', access_token: token })}`);
+  const acctBody = await acctResp.json();
+  if (!acctResp.ok || acctBody.error) {
+    throw new Error(acctBody.error?.message || `Meta API HTTP ${acctResp.status}`);
+  }
+  const accountCurrency = acctBody.currency || null;
+  const workspaceCurrency = ws.currency || 'KES';
+  const fx = await resolveFxRate(ws, accountCurrency, workspaceCurrency);
+  const toWs = (amount) => round2((Number(amount) || 0) * fx.rate);
 
   const [insights, ads, existingRes, firstTopupRes] = await Promise.all([
     graphGetAll(`${act}/insights`, { level: 'ad', date_preset: 'last_30d', fields: INSIGHT_FIELDS }, token),
@@ -121,7 +158,7 @@ export async function syncWorkspace(db, ws, token) {
       meta_ad_id: adId,
       name,
       status: mapStatus(meta?.effective_status),
-      spend: Number(ins?.spend) || 0,
+      spend: toWs(ins?.spend),
       impressions: Number(ins?.impressions) || 0,
       three_sec_views: sumAction(ins?.actions, 'video_view'),
       outbound_clicks: sumAction(ins?.outbound_clicks, 'outbound_click'),
@@ -159,7 +196,14 @@ export async function syncWorkspace(db, ws, token) {
   }
 
   // Spend since the first top-up, for the prepaid M-Pesa balance.
-  const wsPatch = { last_synced_at: now, prepaid_spend: null, prepaid_spend_since: null };
+  const wsPatch = {
+    last_synced_at: now,
+    prepaid_spend: null,
+    prepaid_spend_since: null,
+    ad_account_currency: accountCurrency,
+    fx_rate: fx.rate,
+    fx_rate_at: now
+  };
   const firstTopup = firstTopupRes.data?.[0];
   if (firstTopup) {
     const since = firstTopup.created_at.slice(0, 10);
@@ -169,13 +213,18 @@ export async function syncWorkspace(db, ws, token) {
       { level: 'account', fields: 'spend', time_range: JSON.stringify({ since, until }) },
       token
     );
-    wsPatch.prepaid_spend = acct.reduce((s, r) => s + (Number(r.spend) || 0), 0);
+    wsPatch.prepaid_spend = toWs(acct.reduce((s, r) => s + (Number(r.spend) || 0), 0));
     wsPatch.prepaid_spend_since = since;
   }
   const { error: wsErr } = await db.from('workspaces').update(wsPatch).eq('id', ws.id);
   if (wsErr) throw wsErr;
 
-  return { updated: updates.length, inserted: inserts.length, prepaidSpend: wsPatch.prepaid_spend };
+  return {
+    updated: updates.length,
+    inserted: inserts.length,
+    prepaidSpend: wsPatch.prepaid_spend,
+    currency: { account: accountCurrency, workspace: workspaceCurrency, rate: fx.rate, source: fx.source }
+  };
 }
 
 export default async function handler(req, res) {
@@ -199,7 +248,7 @@ export default async function handler(req, res) {
 
   const { data: workspaces, error } = await db
     .from('workspaces')
-    .select('id, name, meta_ad_account_id')
+    .select('id, name, meta_ad_account_id, currency, ad_account_currency, fx_rate, fx_rate_override')
     .not('meta_ad_account_id', 'is', null)
     .neq('meta_ad_account_id', '');
   if (error) return res.status(500).json({ error: error.message });

@@ -37,6 +37,15 @@ create table if not exists public.workspaces (
 -- Columns added after the first release (no-ops on fresh installs).
 alter table public.workspaces add column if not exists prepaid_spend numeric;
 alter table public.workspaces add column if not exists prepaid_spend_since date;
+-- Ad account currency handling: Meta reports spend in the ad account's currency
+-- (e.g. USD); /api/sync-meta converts it into the workspace currency before saving.
+--   fx_rate_override: admin-set rate (1 ad-account unit = N workspace units), e.g. the
+--                     bank's card rate. When null, a daily market rate is fetched.
+--   fx_rate / fx_rate_at / ad_account_currency: the rate actually applied, written by sync.
+alter table public.workspaces add column if not exists ad_account_currency text;
+alter table public.workspaces add column if not exists fx_rate_override numeric check (fx_rate_override > 0);
+alter table public.workspaces add column if not exists fx_rate numeric;
+alter table public.workspaces add column if not exists fx_rate_at timestamptz;
 
 create table if not exists public.profiles (
   id           uuid primary key references auth.users (id) on delete cascade,
