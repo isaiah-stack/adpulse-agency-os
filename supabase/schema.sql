@@ -231,13 +231,13 @@ returns table (
 )
 language sql stable security definer
 set search_path = public
-as $
+as $$
   select w.id, w.name, w.domain, w.currency, w.daily_budget, w.vat_rate, w.offer_name,
          w.aov, w.gross_margin, w.deposit_pct, w.last_synced_at, w.prepaid_spend,
          w.prepaid_spend_since, w.created_at
   from public.workspaces w
   where w.id = public.my_workspace_id();
-$;
+$$;
 
 revoke all on function public.client_workspace() from public;
 grant execute on function public.client_workspace() to authenticated;
