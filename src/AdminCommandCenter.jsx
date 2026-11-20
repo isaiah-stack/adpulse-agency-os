@@ -45,6 +45,7 @@ import {
 import StatusBadge from './components/StatusBadge';
 import { ClientPortalView } from './components/ClientPortal';
 import TeamAccess from './components/TeamAccess';
+import SyncStatus from './components/SyncStatus';
 import LocalDataImport from './components/LocalDataImport';
 import {
   formatMoney,
@@ -1260,19 +1261,7 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
             <span className="hidden sm:inline-flex">
               <StatusBadge tone="neutral">{activeClient.currentPhase}</StatusBadge>
             </span>
-            {remote && (
-              <span className="hidden xl:inline-flex items-center px-2.5 py-1 rounded-md bg-[#F1F5F9] border border-[#E2E8F0] font-mono text-[11px] text-[#334155] tabular-nums">
-                Meta sync{' '}
-                {activeClient.lastSyncedAt
-                  ? new Date(activeClient.lastSyncedAt).toLocaleString('en-GB', {
-                      day: '2-digit',
-                      month: 'short',
-                      hour: '2-digit',
-                      minute: '2-digit'
-                    })
-                  : 'pending'}
-              </span>
-            )}
+            {remote && <SyncStatus client={activeClient} onSynced={loadRemote} showToast={showToast} />}
             <button
               onClick={() => setIsPreviewingPortal(true)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E5E7EB] bg-white hover:border-slate-300 text-[#334155] text-xs font-medium transition cursor-pointer"

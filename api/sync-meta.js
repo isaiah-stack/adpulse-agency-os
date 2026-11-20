@@ -10,8 +10,13 @@
 //   4. Computes spend since the first M-Pesa top-up for an accurate prepaid balance.
 //   5. Converts spend from the ad account's currency (e.g. USD) into the workspace currency
 //      (e.g. KES) using workspaces.fx_rate_override, else a daily market rate.
-import { createClient } from '@supabase/supabase-js';
+//
+// Callers: Vercel Cron (Authorization: Bearer CRON_SECRET) or a signed-in admin's
+// "Sync now" button (Authorization: Bearer <Supabase access token>, optional
+// ?workspaceId=<uuid> to sync one workspace). Each workspace records its outcome in
+// last_sync_attempt_at / last_sync_error, and meta_token_expires_at tracks the token.
 import { timingSafeEqual } from 'node:crypto';
+import { serviceClient, requireAdmin } from './_lib/supabaseAdmin.js';
 
 const GRAPH = 'https://graph.facebook.com/v21.0';
 const INSIGHT_FIELDS = 'ad_id,ad_name,spend,impressions,outbound_clicks,actions';
@@ -98,12 +103,32 @@ export async function resolveFxRate(ws, from, to, fetchImpl = fetch) {
   }
 }
 
-function authorized(req) {
+function isCron(req) {
   const secret = process.env.CRON_SECRET;
   if (!secret) return false; // fail closed: the endpoint is never public
   const expected = Buffer.from(`Bearer ${secret}`);
   const given = Buffer.from(String(req.headers.authorization || ''));
   return given.length === expected.length && timingSafeEqual(given, expected);
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * When the Meta token stops working: the earlier of the token expiry and Meta's
+ * separate data-access expiry (0 means "never" for either). Null when unknown/never.
+ * A token may inspect itself, so no app secret is needed.
+ */
+export async function metaTokenExpiry(token, fetchImpl = fetch) {
+  try {
+    const qs = new URLSearchParams({ input_token: token, access_token: token });
+    const resp = await fetchImpl(`${GRAPH}/debug_token?${qs}`);
+    const d = (await resp.json())?.data;
+    if (!resp.ok || !d) return null;
+    const times = [d.expires_at, d.data_access_expires_at].map(Number).filter((t) => t > 0);
+    return times.length ? new Date(Math.min(...times) * 1000).toISOString() : null;
+  } catch {
+    return null; // expiry is advisory; never block the sync on it
+  }
 }
 
 export async function syncWorkspace(db, ws, token) {
@@ -198,6 +223,8 @@ export async function syncWorkspace(db, ws, token) {
   // Spend since the first top-up, for the prepaid M-Pesa balance.
   const wsPatch = {
     last_synced_at: now,
+    last_sync_attempt_at: now,
+    last_sync_error: null,
     prepaid_spend: null,
     prepaid_spend_since: null,
     ad_account_currency: accountCurrency,
@@ -228,44 +255,66 @@ export async function syncWorkspace(db, ws, token) {
 }
 
 export default async function handler(req, res) {
-  if (!process.env.CRON_SECRET) {
-    return res.status(500).json({ error: 'CRON_SECRET is not configured; refusing to run.' });
-  }
-  if (!authorized(req)) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const db = serviceClient();
   const token = process.env.META_ACCESS_TOKEN;
-  if (!supabaseUrl || !serviceKey || !token) {
+  if (!db || !token) {
     return res.status(500).json({
       error: 'Missing SUPABASE_URL/VITE_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or META_ACCESS_TOKEN'
     });
   }
+  // Cron secret first (cheap, no network); otherwise require a signed-in admin.
+  const cron = isCron(req);
+  if (!cron && !(await requireAdmin(db, req))) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
 
-  const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
+  const onlyId = cron ? null : String(req.query?.workspaceId || '') || null;
+  if (onlyId && !UUID_RE.test(onlyId)) return res.status(400).json({ error: 'Invalid workspace.' });
 
-  const { data: workspaces, error } = await db
+  let query = db
     .from('workspaces')
     .select('id, name, meta_ad_account_id, currency, ad_account_currency, fx_rate, fx_rate_override')
     .not('meta_ad_account_id', 'is', null)
     .neq('meta_ad_account_id', '');
+  if (onlyId) query = query.eq('id', onlyId);
+  const { data: workspaces, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
+  if (onlyId && !workspaces.length) {
+    return res.status(404).json({ error: 'Workspace not found or has no Meta ad account.' });
+  }
+
+  const tokenExpiresAt = await metaTokenExpiry(token);
 
   const results = [];
   for (const ws of workspaces) {
+    const attemptAt = new Date().toISOString();
     try {
       results.push({ workspace: ws.name, ok: true, ...(await syncWorkspace(db, ws, token)) });
     } catch (err) {
       console.error(`sync-meta failed for ${ws.name}:`, err);
       results.push({ workspace: ws.name, ok: false, error: err.message });
+      const { error: markErr } = await db
+        .from('workspaces')
+        .update({ last_sync_attempt_at: attemptAt, last_sync_error: String(err.message).slice(0, 500) })
+        .eq('id', ws.id);
+      if (markErr) console.error(`could not record sync error for ${ws.name}:`, markErr);
     }
+  }
+
+  // Token health is shared by every workspace the token serves.
+  if (workspaces.length) {
+    const { error: tokErr } = await db
+      .from('workspaces')
+      .update({ meta_token_expires_at: tokenExpiresAt })
+      .in('id', workspaces.map((w) => w.id));
+    if (tokErr) console.error('could not record token expiry:', tokErr);
   }
 
   const failed = results.filter((r) => !r.ok).length;
   return res.status(failed && failed === results.length ? 502 : 200).json({
     syncedAt: new Date().toISOString(),
+    trigger: cron ? 'cron' : 'admin',
+    tokenExpiresAt,
     workspaces: results.length,
     failed,
     results

@@ -76,6 +76,15 @@ export function ClientPortalView({ client, onConfirmDeposit, onSignOut, onRefres
   const runwayDays = Math.max(0, a.daysRunwayLeft);
   const runwayTone = runwayDays < 5 ? 'alert' : runwayDays < 10 ? 'caution' : 'healthy';
 
+  // Before any spend, show setup progress instead of zeros and a red "Top up soon".
+  const preLaunch = spendInclVat === 0;
+  const setupSteps = [
+    { label: 'Ad account connected', done: Boolean(client.lastSyncedAt) },
+    { label: 'First M-Pesa top-up received', done: (client.topUps || []).length > 0 },
+    { label: 'First ad running', done: (client.creatives || []).some((c) => c.status === 'Active') }
+  ];
+  const setupDone = setupSteps.filter((s) => s.done).length;
+
   const leads = [...(client.leads || [])].sort(
     (x, y) => new Date(y.createdAt || 0) - new Date(x.createdAt || 0)
   );
@@ -160,6 +169,50 @@ export function ClientPortalView({ client, onConfirmDeposit, onSignOut, onRefres
       </header>
 
       <main className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {preLaunch && (
+          <section className="card-surface rounded-xl p-5 sm:p-6 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-[#64748B]">
+                  Getting your campaigns ready
+                </div>
+                <p className="text-sm text-[#475569] mt-1.5 max-w-xl">
+                  Your results dashboard switches on automatically once your first ad starts spending.
+                  Here is where setup stands.
+                </p>
+              </div>
+              <StatusBadge tone={setupDone === setupSteps.length ? 'healthy' : 'neutral'}>
+                {setupDone} of {setupSteps.length} complete
+              </StatusBadge>
+            </div>
+            <ol className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {setupSteps.map((step, i) => (
+                <li
+                  key={step.label}
+                  className={`flex items-center gap-3 rounded-lg border px-4 py-3 ${
+                    step.done ? 'border-emerald-200 bg-emerald-50/60' : 'border-[#E5E7EB] bg-white'
+                  }`}
+                >
+                  <span
+                    className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-[11px] font-mono font-semibold ${
+                      step.done ? 'bg-emerald-600 text-white' : 'bg-[#F1F5F9] text-[#64748B]'
+                    }`}
+                    aria-hidden="true"
+                  >
+                    {step.done ? <CheckCircle2 className="w-3.5 h-3.5" strokeWidth={2} /> : i + 1}
+                  </span>
+                  <span className={`text-sm ${step.done ? 'text-[#0F172A]' : 'text-[#475569]'}`}>
+                    {step.label}
+                    <span className="sr-only">{step.done ? ' (done)' : ' (pending)'}</span>
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
+
+        {!preLaunch && (
+          <>
         {/* ROI summary + runway */}
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 card-surface rounded-xl p-5 space-y-3">
@@ -250,6 +303,8 @@ export function ClientPortalView({ client, onConfirmDeposit, onSignOut, onRefres
             sub={`From bookings on inquiries received ${period}`}
           />
         </section>
+          </>
+        )}
 
         {/* Inquiries & bookings */}
         <section className="card-surface rounded-xl overflow-hidden">
