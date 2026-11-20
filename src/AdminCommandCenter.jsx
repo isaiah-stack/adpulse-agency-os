@@ -13,18 +13,15 @@ import {
   Pause,
   RotateCcw,
   Trash2,
-  ExternalLink,
   Copy,
   Check,
   Sliders,
   Layers,
   Award,
   Clock,
-  ShieldAlert,
   FileSpreadsheet,
   RefreshCw,
   X,
-  LayoutGrid,
   Lock,
   FileCheck2,
   Share2,
@@ -3661,34 +3658,42 @@ function TaxonomyAndQaView({ client, onToggleQa, showToast }) {
 // VIEW 7: 10-DAY SPRINT & RULE OF 100 ROUTINE
 // ============================================================================
 
+const SPRINT_BLOCKS = {
+  speed: { label: 'Speed-to-Lead & Quotes', mins: 40 },
+  creative: { label: 'Creative & B-Roll Hooks', mins: 30 },
+  data: { label: 'Data & Ad Hygiene', mins: 30 }
+};
+
 function SprintAndRoutineView({ client, onToggleTask, onAddRuleLog, onUpdateStreak, showToast }) {
   const { sprintChecklist, ruleOf100Logs, streakDays = 0 } = client;
 
-  const blocks = {
-    speed: { label: 'Speed-to-Lead & Quotes', mins: 40 },
-    creative: { label: 'Creative & B-Roll Hooks', mins: 30 },
-    data: { label: 'Data & Ad Hygiene', mins: 30 }
-  };
+  const blocks = SPRINT_BLOCKS;
 
   const [activeBlock, setActiveBlock] = useState('speed');
   const [secondsLeft, setSecondsLeft] = useState(40 * 60);
   const [isRunning, setIsRunning] = useState(false);
   const [logNotes, setLogNotes] = useState('');
 
+  // Latest values for the interval callback, so the timer isn't reset on every tick.
+  const latestRef = useRef({ secondsLeft, activeBlock, showToast });
+  useEffect(() => {
+    latestRef.current = { secondsLeft, activeBlock, showToast };
+  });
+
   useEffect(() => {
     if (!isRunning) return;
     const t = setInterval(() => {
-      setSecondsLeft((prev) => {
-        if (prev <= 1) {
-          setIsRunning(false);
-          showToast(`Completed ${blocks[activeBlock].label} session.`);
-          return 0;
-        }
-        return prev - 1;
-      });
+      const { secondsLeft: s, activeBlock: block, showToast: toast } = latestRef.current;
+      if (s <= 1) {
+        setSecondsLeft(0);
+        setIsRunning(false);
+        toast(`Completed ${SPRINT_BLOCKS[block].label} session.`);
+      } else {
+        setSecondsLeft(s - 1);
+      }
     }, 1000);
     return () => clearInterval(t);
-  }, [isRunning, activeBlock]);
+  }, [isRunning]);
 
   const selectBlock = (k) => {
     setIsRunning(false);
@@ -3891,6 +3896,7 @@ function SprintAndRoutineView({ client, onToggleTask, onAddRuleLog, onUpdateStre
 function CaseStudyReportView({ client, analytics, showToast }) {
   const { currency, creatives } = client;
   const [copied, setCopied] = useState(false);
+  const [reportDate] = useState(() => new Date().toISOString().slice(0, 10));
 
   const winningCreative = useMemo(() => {
     const sorted = [...creatives].sort((a, b) => (Number(b.leads) || 0) - (Number(a.leads) || 0));
@@ -3930,7 +3936,7 @@ Attribution Stack: Meta Pixel + PostHog UTMs + SHA-256 Offline CAPI Dataset.`;
               <StatusBadge tone="healthy" icon={FileCheck2}>
                 Verified Proof-of-Work • PII Redacted
               </StatusBadge>
-              <span className="font-mono text-xs text-[#64748B]">{new Date().toISOString().slice(0, 10)}</span>
+              <span className="font-mono text-xs text-[#64748B]">{reportDate}</span>
             </div>
             <h2 className="text-xl font-bold text-[#0F172A] tracking-tight mt-3">{client.name}</h2>
             <p className="text-xs text-[#64748B] mt-0.5">
