@@ -42,10 +42,13 @@ import {
   ArrowUpRight,
   ClipboardList,
   LogOut,
-  Eye
+  Eye,
+  Users
 } from 'lucide-react';
 import StatusBadge from './components/StatusBadge';
 import { ClientPortalView } from './components/ClientPortal';
+import TeamAccess from './components/TeamAccess';
+import LocalDataImport from './components/LocalDataImport';
 import {
   formatMoney,
   formatDec,
@@ -58,7 +61,8 @@ import {
   persistClientDiff,
   ensureUuids,
   createWorkspace,
-  deleteWorkspace
+  deleteWorkspace,
+  importWorkspaces
 } from './lib/dataService';
 
 // ============================================================================
@@ -67,6 +71,28 @@ import {
 
 const SCHEMA_VERSION = 3;
 const STORAGE_KEY = 'adpulse_agency_os_v3';
+// Supabase mode keeps its own small key so it never overwrites local-mode data.
+const REMOTE_PREFS_KEY = 'adpulse_agency_os_remote_prefs';
+const LOCAL_MIGRATED_KEY = 'adpulse_agency_os_local_migrated_at';
+
+const readJson = (key) => {
+  try {
+    return JSON.parse(localStorage.getItem(key) || 'null');
+  } catch {
+    return null;
+  }
+};
+
+// Workspaces saved by local mode in this browser that have not been imported yet.
+function readUnmigratedLocalClients() {
+  try {
+    if (localStorage.getItem(LOCAL_MIGRATED_KEY)) return [];
+  } catch {
+    return [];
+  }
+  const saved = readJson(STORAGE_KEY);
+  return saved?.schemaVersion === SCHEMA_VERSION && Array.isArray(saved.clients) ? saved.clients : [];
+}
 
 const PHASES = [
   {
@@ -169,6 +195,11 @@ const NAV_GROUPS = [
     ]
   }
 ];
+
+const ADMIN_NAV_GROUP = {
+  label: 'ADMINISTRATION',
+  items: [{ id: 'team', label: 'Team & Access', icon: Users }]
+};
 
 const hoursAgoISO = (hours) => new Date(Date.now() - hours * 3600 * 1000).toISOString();
 const daysAgoDate = (days) => new Date(Date.now() - days * 86400 * 1000).toISOString().slice(0, 10);
@@ -607,6 +638,7 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
   });
 
   const [activeClientId, setActiveClientId] = useState(() => {
+    if (remote) return readJson(REMOTE_PREFS_KEY)?.activeClientId || null;
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -627,6 +659,10 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
   const [isQuickLeadOpen, setIsQuickLeadOpen] = useState(false);
   const [isPreviewingPortal, setIsPreviewingPortal] = useState(false);
   const [remoteStatus, setRemoteStatus] = useState(remote ? 'loading' : 'ready');
+  // { source: 'browser' | 'file', workspaces: [...] } while the import picker is open.
+  const [importRequest, setImportRequest] = useState(null);
+  const [localPending, setLocalPending] = useState(() => (remote ? readUnmigratedLocalClients() : []));
+  const navGroups = useMemo(() => (remote ? [...NAV_GROUPS, ADMIN_NAV_GROUP] : NAV_GROUPS), [remote]);
   const [toast, setToast] = useState(null);
   const fileInputRef = useRef(null);
 
@@ -648,14 +684,18 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
 
   useEffect(() => {
     try {
+      if (remote) {
+        // Supabase is the source of truth; only remember the selected workspace.
+        localStorage.setItem(REMOTE_PREFS_KEY, JSON.stringify({ activeClientId }));
+        return;
+      }
       localStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({
           schemaVersion: SCHEMA_VERSION,
           updatedAt: new Date().toISOString(),
           activeClientId,
-          // Remote mode only remembers the selection; Supabase is the source of truth.
-          clients: remote ? [] : clients
+          clients
         })
       );
     } catch (err) {
@@ -681,12 +721,12 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
   );
 
   const currentNavMeta = useMemo(() => {
-    for (const g of NAV_GROUPS) {
+    for (const g of navGroups) {
       const found = g.items.find((i) => i.id === activeView);
       if (found) return { group: g.label, ...found };
     }
     return { group: 'OVERVIEW', id: 'summary', label: 'Financial Summary' };
-  }, [activeView]);
+  }, [activeView, navGroups]);
 
   const updateActiveClient = (updater) => {
     const prevClient = activeClient;
@@ -730,6 +770,10 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
         const parsed = JSON.parse(ev.target.result);
         const list = Array.isArray(parsed) ? parsed : parsed.clients;
         if (!Array.isArray(list) || list.length === 0) throw new Error('Invalid format');
+        if (remote) {
+          setImportRequest({ source: 'file', workspaces: list });
+          return;
+        }
         setClients(list);
         setActiveClientId(list[0].id);
         showToast(`Restored ${list.length} workspace(s) from backup.`);
@@ -841,6 +885,41 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
     showToast(`Logged inquiry from ${leadEntry.name} (${normalizeKenyaPhoneE164(leadEntry.phone)}).`);
   };
 
+  const markLocalMigrated = () => {
+    try {
+      localStorage.setItem(LOCAL_MIGRATED_KEY, new Date().toISOString());
+    } catch {
+      // ignore
+    }
+    setLocalPending([]);
+  };
+
+  const handleImportToSupabase = async (selected) => {
+    try {
+      const summary = await importWorkspaces(selected, clients);
+      if (importRequest?.source === 'browser') markLocalMigrated();
+      setImportRequest(null);
+      await loadRemote();
+      showToast(
+        `Imported: ${summary.created} new, ${summary.merged} merged workspace(s); ${summary.leads} leads, ${summary.creatives} ads, ${summary.topUps} top-ups.`
+      );
+    } catch (err) {
+      console.error('Import failed:', err);
+      showToast(`Import failed: ${err.message}. Re-running skips items already imported.`, 'alert');
+      await loadRemote();
+    }
+  };
+
+  const importModal = importRequest && (
+    <LocalDataImport
+      source={importRequest.source}
+      workspaces={importRequest.workspaces}
+      existing={clients}
+      onImport={handleImportToSupabase}
+      onClose={() => setImportRequest(null)}
+    />
+  );
+
   // Remote-mode loading / empty / error states (no workspace to render yet).
   if (!activeClient) {
     return (
@@ -877,6 +956,14 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
                   New Client Workspace
                 </button>
               )}
+              {remoteStatus === 'ready' && localPending.length > 0 && (
+                <button
+                  onClick={() => setImportRequest({ source: 'browser', workspaces: localPending })}
+                  className="px-3 py-1.5 rounded-lg border border-[#E5E7EB] bg-white text-xs font-medium text-[#334155] cursor-pointer"
+                >
+                  Import {localPending.length} from this browser
+                </button>
+              )}
               {onSignOut && (
                 <button
                   onClick={onSignOut}
@@ -891,6 +978,7 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
         {isAddClientOpen && (
           <AddClientModal onClose={() => setIsAddClientOpen(false)} onCreate={handleCreateClient} />
         )}
+        {importModal}
       </div>
     );
   }
@@ -983,7 +1071,7 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
 
       {/* Grouped Navigation */}
       <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5" aria-label="Primary Navigation">
-        {NAV_GROUPS.map((group) => (
+        {navGroups.map((group) => (
           <div key={group.label}>
             <div className="px-2.5 mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#64748B]">
               {group.label}
@@ -1038,7 +1126,25 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
             Signed in as <span className="font-mono text-[#334155]">{profile.email}</span>
           </div>
         )}
-        <div className={`grid gap-1.5 ${remote ? 'grid-cols-1' : 'grid-cols-2'}`}>
+        {remote && localPending.length > 0 && (
+          <div className="rounded-md border border-[#FDE68A] bg-[#FFFBEB] p-2.5 space-y-1.5">
+            <div className="text-[11px] text-[#92400E]">
+              {localPending.length} workspace(s) saved in this browser from local mode.
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setImportRequest({ source: 'browser', workspaces: localPending })}
+                className="text-[11px] font-semibold text-[#0F172A] underline cursor-pointer"
+              >
+                Review and import
+              </button>
+              <button onClick={markLocalMigrated} className="text-[11px] text-[#64748B] cursor-pointer">
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="grid gap-1.5 grid-cols-2">
           <button
             onClick={handleExportJSON}
             className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white border border-[#E5E7EB] hover:border-slate-300 text-xs font-medium text-[#334155] transition cursor-pointer"
@@ -1046,24 +1152,20 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
             <Download className="w-3.5 h-3.5 text-[#475569]" strokeWidth={1.75} />
             Export JSON
           </button>
-          {!remote && (
-            <>
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white border border-[#E5E7EB] hover:border-slate-300 text-xs font-medium text-[#334155] transition cursor-pointer"
-              >
-                <Upload className="w-3.5 h-3.5 text-[#475569]" strokeWidth={1.75} />
-                Import JSON
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".json"
-                onChange={handleImportJSON}
-                className="hidden"
-              />
-            </>
-          )}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white border border-[#E5E7EB] hover:border-slate-300 text-xs font-medium text-[#334155] transition cursor-pointer"
+          >
+            <Upload className="w-3.5 h-3.5 text-[#475569]" strokeWidth={1.75} />
+            Import JSON
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json"
+            onChange={handleImportJSON}
+            className="hidden"
+          />
         </div>
         <div className="flex items-center justify-between px-1">
           <span className="text-[11px] font-mono text-[#64748B]">
@@ -1300,6 +1402,10 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
             />
           )}
 
+          {activeView === 'team' && remote && (
+            <TeamAccess workspaces={clients} currentUserId={profile?.id} showToast={showToast} />
+          )}
+
           {activeView === 'casestudy' && (
             <CaseStudyReportView
               client={activeClient}
@@ -1311,6 +1417,7 @@ export default function AdminCommandCenter({ remote = false, profile = null, onS
       </div>
 
       {/* Modals */}
+      {importModal}
       {isAddClientOpen && (
         <AddClientModal
           onClose={() => setIsAddClientOpen(false)}
@@ -2621,9 +2728,15 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
                           {Math.floor(diag.hoursActive / 24)}d {Math.floor(diag.hoursActive % 24)}h
                         </span>
                       </div>
+                      {ad.metaAdId && (
+                        <span className="block mt-1 text-[10px] font-medium uppercase tracking-wider text-[#64748B]">
+                          Synced from Meta
+                        </span>
+                      )}
                       <input
                         type="text"
                         value={ad.adName}
+                        readOnly={Boolean(ad.metaAdId)}
                         onChange={(e) => handleField(ad.id, 'adName', e.target.value)}
                         className="w-full bg-transparent font-mono text-xs font-medium text-[#0F172A] mt-1 focus:bg-white focus:outline-none focus:ring-1 focus:ring-slate-300 rounded px-0.5"
                       />
@@ -2631,6 +2744,8 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
                     <td className="py-3 px-2">
                       <select
                         value={ad.status}
+                        disabled={Boolean(ad.metaAdId)}
+                        title={ad.metaAdId ? 'Status is synced from Meta Ads Manager' : undefined}
                         onChange={(e) => handleField(ad.id, 'status', e.target.value)}
                         className="bg-white border border-[#E5E7EB] rounded-md px-2 py-1 text-xs font-medium text-[#0F172A] cursor-pointer"
                       >
@@ -2640,13 +2755,13 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
                       </select>
                     </td>
                     <td className="py-3 px-2 text-right">
-                      <InlineNum value={ad.spend} onChange={(v) => handleField(ad.id, 'spend', v)} />
+                      <InlineNum value={ad.spend} readOnly={Boolean(ad.metaAdId)} onChange={(v) => handleField(ad.id, 'spend', v)} />
                     </td>
                     <td className="py-3 px-2 text-right">
-                      <InlineNum value={ad.impressions} onChange={(v) => handleField(ad.id, 'impressions', v)} />
+                      <InlineNum value={ad.impressions} readOnly={Boolean(ad.metaAdId)} onChange={(v) => handleField(ad.id, 'impressions', v)} />
                     </td>
                     <td className="py-3 px-2 text-right">
-                      <InlineNum value={ad.threeSecPlays} onChange={(v) => handleField(ad.id, 'threeSecPlays', v)} />
+                      <InlineNum value={ad.threeSecPlays} readOnly={Boolean(ad.metaAdId)} onChange={(v) => handleField(ad.id, 'threeSecPlays', v)} />
                     </td>
                     <td className="py-3 px-2 text-right font-mono font-medium tabular-nums">
                       <span className={diag.hookRate >= 25 ? 'text-[#065F46]' : 'text-[#92400E]'}>
@@ -2654,7 +2769,7 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
                       </span>
                     </td>
                     <td className="py-3 px-2 text-right">
-                      <InlineNum value={ad.outboundClicks} onChange={(v) => handleField(ad.id, 'outboundClicks', v)} />
+                      <InlineNum value={ad.outboundClicks} readOnly={Boolean(ad.metaAdId)} onChange={(v) => handleField(ad.id, 'outboundClicks', v)} />
                     </td>
                     <td className="py-3 px-2 text-right font-mono font-medium tabular-nums">
                       <span className={diag.outboundCtr >= 1.0 ? 'text-[#065F46]' : 'text-[#92400E]'}>
@@ -2662,7 +2777,7 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
                       </span>
                     </td>
                     <td className="py-3 px-2 text-right">
-                      <InlineNum value={ad.leads} onChange={(v) => handleField(ad.id, 'leads', v)} />
+                      <InlineNum value={ad.leads} readOnly={Boolean(ad.metaAdId)} onChange={(v) => handleField(ad.id, 'leads', v)} />
                     </td>
                     <td className="py-3 px-2 text-right font-mono tabular-nums text-[#334155]">
                       {diag.cpl !== null ? Math.round(diag.cpl).toLocaleString() : '-'}
@@ -2697,7 +2812,17 @@ function CreativeDiagnosticsView({ client, analytics, onUpdateCreatives, showToa
   );
 }
 
-function InlineNum({ value, onChange }) {
+function InlineNum({ value, onChange, readOnly = false }) {
+  if (readOnly) {
+    return (
+      <span
+        className="inline-block w-16 text-right px-1.5 py-1 font-mono text-xs tabular-nums text-[#0F172A]"
+        title="Synced from Meta"
+      >
+        {Number(value || 0).toLocaleString()}
+      </span>
+    );
+  }
   return (
     <input
       type="number"

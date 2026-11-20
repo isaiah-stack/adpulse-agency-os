@@ -247,9 +247,10 @@ drop policy if exists profiles_admin_all     on public.profiles;
 drop policy if exists profiles_client_select on public.profiles;
 create policy profiles_admin_all on public.profiles
   for all to authenticated using (public.is_admin()) with check (public.is_admin());
+-- Non-admins can read only their own profile (no co-worker names or emails).
 create policy profiles_client_select on public.profiles
   for select to authenticated
-  using (id = auth.uid() or workspace_id = public.my_workspace_id());
+  using (id = auth.uid());
 
 -- ad_creatives
 drop policy if exists ad_creatives_admin_all     on public.ad_creatives;

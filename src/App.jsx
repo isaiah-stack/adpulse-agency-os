@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { LogOut } from 'lucide-react';
-import { supabase, isSupabaseConfigured } from './lib/supabase';
+import { supabase, isSupabaseConfigured, initialAuthLinkType } from './lib/supabase';
 import AdminCommandCenter from './AdminCommandCenter';
 import ClientPortal from './components/ClientPortal';
-import LoginScreen from './components/LoginScreen';
+import LoginScreen, { SetPasswordScreen } from './components/LoginScreen';
 
 function CenteredMessage({ children, onSignOut }) {
   return (
@@ -32,12 +32,17 @@ export default function App() {
 
 function AuthenticatedApp() {
   const [session, setSession] = useState(undefined); // undefined = resolving
+  // 'invite' | 'recovery' while the user must choose a password after following an email link.
+  const [passwordFlow, setPasswordFlow] = useState(initialAuthLinkType);
   // Profile lookup result, tagged with the user it belongs to so stale results are ignored.
   const [profileResult, setProfileResult] = useState({ userId: null, profile: null });
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => setSession(next ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
+      setSession(next ?? null);
+      if (event === 'PASSWORD_RECOVERY') setPasswordFlow('recovery');
+    });
     return () => sub.subscription.unsubscribe();
   }, []);
 
@@ -67,6 +72,15 @@ function AuthenticatedApp() {
 
   if (session === undefined) return <CenteredMessage>Checking session</CenteredMessage>;
   if (!session) return <LoginScreen />;
+  if (passwordFlow) {
+    return (
+      <SetPasswordScreen
+        variant={passwordFlow}
+        email={session.user?.email}
+        onDone={() => setPasswordFlow(null)}
+      />
+    );
+  }
   if (!profileLoaded) {
     return <CenteredMessage>Loading your profile</CenteredMessage>;
   }

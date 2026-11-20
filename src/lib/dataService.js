@@ -233,25 +233,51 @@ export function ensureUuids(client) {
   return { ...client, creatives: fix(client.creatives), leads: fix(client.leads), topUps: fix(client.topUps) };
 }
 
-/** Persist the difference between two versions of the same workspace object. */
+// Only the keys whose values differ; used so a save never rewrites columns the
+// admin did not touch (e.g. figures the Meta sync updated after the page loaded).
+const changedFields = (before, after) => {
+  const patch = {};
+  for (const k of Object.keys(after)) {
+    if (JSON.stringify(before?.[k]) !== JSON.stringify(after[k])) patch[k] = after[k];
+  }
+  return patch;
+};
+
+// Columns owned by /api/sync-meta for ads linked to Meta; the admin UI never writes them.
+const META_OWNED = ['name', 'status', 'launched_at', 'spend', 'impressions', 'three_sec_views', 'outbound_clicks', 'leads'];
+
+/** Persist the difference between two versions of the same workspace object, field by field. */
 export async function persistClientDiff(prev, next) {
   const tasks = [];
-  const prevWs = JSON.stringify(workspaceToRow(prev));
-  const nextWsRow = workspaceToRow(next);
-  if (prevWs !== JSON.stringify(nextWsRow)) {
-    tasks.push(supabase.from('workspaces').update(nextWsRow).eq('id', next.id).then(unwrap));
+  const wsPatch = changedFields(workspaceToRow(prev), workspaceToRow(next));
+  if (Object.keys(wsPatch).length) {
+    tasks.push(supabase.from('workspaces').update(wsPatch).eq('id', next.id).then(unwrap));
   }
 
   for (const { key, table, toRow } of COLLECTIONS) {
-    const before = new Map((prev[key] || []).map((x) => [x.id, JSON.stringify(toRow(prev.id, x))]));
-    const after = (next[key] || []).map((x) => toRow(next.id, x));
-    const afterIds = new Set(after.map((r) => r.id));
+    const before = new Map((prev[key] || []).map((x) => [x.id, { item: x, row: toRow(prev.id, x) }]));
+    const afterItems = next[key] || [];
+    const afterIds = new Set(afterItems.map((x) => x.id));
+    const inserts = [];
 
-    const changed = after.filter((r) => before.get(r.id) !== JSON.stringify(r));
-    if (key === 'creatives') changed.forEach((r) => (r.updated_at = new Date().toISOString()));
+    for (const item of afterItems) {
+      const row = toRow(next.id, item);
+      const old = before.get(item.id);
+      if (!old) {
+        inserts.push(row);
+        continue;
+      }
+      const patch = changedFields(old.row, row);
+      delete patch.id;
+      delete patch.workspace_id;
+      if (key === 'creatives' && old.item.metaAdId) META_OWNED.forEach((k) => delete patch[k]);
+      if (!Object.keys(patch).length) continue;
+      if (key === 'creatives') patch.updated_at = new Date().toISOString();
+      tasks.push(supabase.from(table).update(patch).eq('id', item.id).then(unwrap));
+    }
+
     const removed = [...before.keys()].filter((id) => !afterIds.has(id));
-
-    if (changed.length) tasks.push(supabase.from(table).upsert(changed, { onConflict: 'id' }).then(unwrap));
+    if (inserts.length) tasks.push(supabase.from(table).insert(inserts).then(unwrap));
     if (removed.length) tasks.push(supabase.from(table).delete().in('id', removed).then(unwrap));
   }
   await Promise.all(tasks);
@@ -277,4 +303,84 @@ export async function confirmLeadDeposit(leadId, depositAmount) {
       .update({ status: 'Deposit Paid', deposit_amount: num(depositAmount) })
       .eq('id', leadId)
   );
+}
+
+// ---------------------------------------------------------------------------
+// Local -> Supabase migration (browser-stored data or JSON backups)
+// ---------------------------------------------------------------------------
+
+const norm = (s) => String(s || '').trim().toLowerCase();
+const acct = (s) => String(s || '').replace(/^act_/, '').trim();
+const phoneDigits = (p) => {
+  let d = String(p || '').replace(/\D/g, '');
+  if (d.startsWith('0') && d.length === 10) d = '254' + d.slice(1);
+  return d;
+};
+const leadKey = (l) => `${phoneDigits(l.phone)}|${norm(l.name)}|${String(l.createdAt || '').slice(0, 16)}`;
+const creativeKey = (c) => `${norm(c.assetId)}|${norm(c.adName)}`;
+const topupKey = (t) => `${num(t.grossAmount)}|${String(t.date || '').slice(0, 10)}`;
+const hasOps = (c) =>
+  Object.keys(c.qaChecklist || {}).length > 0 ||
+  Object.keys(c.sprintChecklist || {}).length > 0 ||
+  (c.ruleOf100Logs || []).length > 0 ||
+  num(c.streakDays) > 0;
+
+/** Find the Supabase workspace a local workspace corresponds to (Meta account, then name). */
+export function matchWorkspace(local, existing) {
+  return (
+    existing.find((e) => acct(local.metaAccountId) && acct(e.metaAccountId) === acct(local.metaAccountId)) ||
+    existing.find((e) => norm(e.name) === norm(local.name)) ||
+    null
+  );
+}
+
+/**
+ * Import local workspaces into Supabase. New workspaces are created; matching ones keep
+ * their Supabase settings and only gain the leads, creatives and top-ups they don't already
+ * have (plus the local checklists/logs if the Supabase copy has none). Safe to re-run.
+ */
+export async function importWorkspaces(localClients, existing) {
+  const summary = { created: 0, merged: 0, leads: 0, creatives: 0, topUps: 0 };
+  for (const local of localClients) {
+    const match = matchWorkspace(local, existing);
+    if (!match) {
+      const created = await createWorkspace(local);
+      existing = [...existing, created];
+      summary.created += 1;
+      summary.leads += created.leads.length;
+      summary.creatives += created.creatives.length;
+      summary.topUps += created.topUps.length;
+      continue;
+    }
+
+    const missing = (items, have, keyFn) => {
+      const keys = new Set(have.map(keyFn));
+      return (items || []).filter((x) => !keys.has(keyFn(x)));
+    };
+    const newLeads = missing(local.leads, match.leads, leadKey);
+    const newCreatives = missing(local.creatives, match.creatives, creativeKey);
+    const newTopUps = missing(local.topUps, match.topUps, topupKey);
+    const takeOps = !hasOps(match) && hasOps(local);
+
+    const next = ensureUuids({
+      ...match,
+      leads: [...match.leads, ...newLeads],
+      creatives: [...match.creatives, ...newCreatives.map((c) => ({ ...c, metaAdId: '' }))],
+      topUps: [...match.topUps, ...newTopUps],
+      ...(takeOps
+        ? {
+            qaChecklist: local.qaChecklist || {},
+            sprintChecklist: local.sprintChecklist || {},
+            streakDays: num(local.streakDays),
+            ruleOf100Logs: local.ruleOf100Logs || []
+          }
+        : {})
+    });
+    await persistClientDiff(match, next);
+    summary.merged += 1;
+    summary.leads += newLeads.length;
+    summary.creatives += newCreatives.length;
+    summary.topUps += newTopUps.length;
+  }
+  return summary;
 }
